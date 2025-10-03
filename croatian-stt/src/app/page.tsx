@@ -168,8 +168,8 @@ export default function Home() {
         <h2 className="text-sm uppercase tracking-wide text-zinc-500">
           Live transcript
         </h2>
-        <div className="min-h-[120px] rounded-xl border bg-white p-4 shadow-sm">
-          <p className="whitespace-pre-wrap text-lg leading-relaxed">
+        <div className="min-h-[120px] rounded-xl border bg-white p-4 shadow-sm text-zinc-900 dark:bg-zinc-900 dark:text-zinc-50">
+          <p className="whitespace-pre-wrap text-lg leading-relaxed text-zinc-900 dark:text-zinc-50">
             {transcript
               ? transcript
               : status === "live"

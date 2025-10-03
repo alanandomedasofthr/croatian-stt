@@ -7,6 +7,7 @@ import os
 import re
 import textwrap
 import platform
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +21,43 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+
+_initial_env_keys = set(os.environ.keys())
+
+# ---------- ENV ----------
+def load_env_from_file(path: Path, *, overwrite: bool = False) -> None:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except OSError as err:  # pragma: no cover - diagnostic only
+        print(f"Failed to read env file {path}: {err}")
+        return
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        if key in os.environ and (not overwrite or key in _initial_env_keys):
+            continue
+        value = value.strip()
+        if value and value[0] == value[-1] and value[0] in {"\"", "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+env_dir = Path(__file__).resolve().parent
+load_env_from_file(env_dir / ".env")
+load_env_from_file(env_dir / ".env.local", overwrite=True)
+
 
 # ---------- CONFIG ----------
 SAMPLE_RATE = 16000        # client sends PCM 16k mono
@@ -106,6 +144,14 @@ if ASR_BACKEND not in VALID_BACKENDS:
 selected_backend = "whisperx"
 mlx_whisper_module: Any | None = None
 
+BackendEntry = tuple[Callable[[np.ndarray], list[dict[str, Any]]], Callable[[], None], str]
+backend_cache: dict[tuple[str, ...], BackendEntry] = {}
+
+
+_warmup_lock = threading.Lock()
+warmed_backends: set[tuple[str, str]] = set()
+warming_backends: set[tuple[str, str]] = set()
+
 if ASR_BACKEND in {"auto", "mlx"}:
     try:
         mlx_whisper_module = importlib.import_module("mlx_whisper")  # type: ignore[import-untyped]
@@ -134,7 +180,12 @@ def build_transcribe_kwargs(transcribe_model: Any) -> dict[str, object]:
     return kwargs
 
 
-def configure_whisperx(initial_device: str) -> tuple[Callable[[np.ndarray], list[dict]], Callable[[], None], str]:
+def configure_whisperx(initial_device: str) -> BackendEntry:
+    cache_key = ("whisperx", initial_device)
+    cached = backend_cache.get(cache_key)
+    if cached:
+        return cached
+
     device = initial_device
     print("Loading models on:", device)
 
@@ -163,13 +214,17 @@ def configure_whisperx(initial_device: str) -> tuple[Callable[[np.ndarray], list
                     f"Failed to initialize openai/whisper on '{device}': {inner_exc}; "
                     f"falling back to {fallback_device}"
                 )
-                return configure_whisperx(fallback_device)
+                entry = configure_whisperx(fallback_device)
+                backend_cache[cache_key] = entry
+                return entry
         elif device != "cpu":
             fallback_device = "cuda" if torch.cuda.is_available() else "cpu"
             if fallback_device == device:
                 raise
             print(f"WhisperX unavailable on '{device}'; falling back to {fallback_device}")
-            return configure_whisperx(fallback_device)
+            entry = configure_whisperx(fallback_device)
+            backend_cache[cache_key] = entry
+            return entry
         else:
             raise
 
@@ -178,7 +233,7 @@ def configure_whisperx(initial_device: str) -> tuple[Callable[[np.ndarray], list
 
     transcribe_kwargs = build_transcribe_kwargs(model)
 
-    def whisperx_transcribe(audio: np.ndarray) -> list[dict]:
+    def whisperx_transcribe(audio: np.ndarray) -> list[dict[str, Any]]:
         result = model.transcribe(audio, **transcribe_kwargs)
         segments = result.get("segments", [])
         if not segments:
@@ -189,10 +244,14 @@ def configure_whisperx(initial_device: str) -> tuple[Callable[[np.ndarray], list
     def sync() -> None:
         mps_sync(device)
 
-    return whisperx_transcribe, sync, device
+    entry: BackendEntry = (whisperx_transcribe, sync, device)
+    backend_cache[("whisperx", device)] = entry
+    if device != initial_device:
+        backend_cache[cache_key] = entry
+    return entry
 
 
-transcribe_window: Callable[[np.ndarray], list[dict]]
+transcribe_window: Callable[[np.ndarray], list[dict[str, Any]]]
 backend_sync: Callable[[], None]
 
 
@@ -202,12 +261,53 @@ def switch_to_whisperx() -> None:
     selected_backend = "whisperx"
     DEVICE = new_device
     print(f"Switched to WhisperX backend: {new_device}")
+    warmup_backend(PROCESS_WINDOW_S)
 
 
-def configure_mlx(mlx_module: Any) -> tuple[Callable[[np.ndarray], list[dict]], Callable[[], None], str]:
+def warmup_backend(seconds: int = 1) -> None:
+    if seconds <= 0:
+        return
+
+    backend_key = (selected_backend, DEVICE)
+    if backend_key in warmed_backends:
+        return
+
+    with _warmup_lock:
+        if backend_key in warmed_backends or backend_key in warming_backends:
+            return
+        warming_backends.add(backend_key)
+
+    print(f"Warming {selected_backend} backend on {DEVICE} with {seconds}s of silence")
+    dummy_audio = np.zeros(SAMPLE_RATE * seconds, dtype=np.float32)
+    try:
+        _ = transcribe_window(dummy_audio)
+        backend_sync()
+    except Exception as err:  # pragma: no cover - warmup resilience
+        print(f"Backend warmup failed: {err}")
+        with _warmup_lock:
+            warming_backends.discard(backend_key)
+        return
+
+    with _warmup_lock:
+        warming_backends.discard(backend_key)
+        warmed_backends.add(backend_key)
+    print("Backend warmup complete")
+
+
+def configure_mlx(mlx_module: Any) -> BackendEntry:
+    cache_key = (
+        "mlx",
+        MLX_WHISPER_MODEL,
+        ASR_LANGUAGE,
+        "fp16" if MLX_WHISPER_FP16 else "fp32",
+    )
+    cached = backend_cache.get(cache_key)
+    if cached:
+        return cached
+
     print(f"Loading MLX Whisper model: {MLX_WHISPER_MODEL}")
 
-    def mlx_transcribe(audio: np.ndarray) -> list[dict]:
+    def mlx_transcribe(audio: np.ndarray) -> list[dict[str, Any]]:
         try:
             result = mlx_module.transcribe(
                 audio,
@@ -234,11 +334,14 @@ def configure_mlx(mlx_module: Any) -> tuple[Callable[[np.ndarray], list[dict]], 
     def sync() -> None:
         return None
 
-    return mlx_transcribe, sync, "mlx"
+    entry: BackendEntry = (mlx_transcribe, sync, "mlx")
+    backend_cache[cache_key] = entry
+    return entry
 
 
 if selected_backend == "mlx" and mlx_whisper_module is not None:
     transcribe_window, backend_sync, DEVICE = configure_mlx(mlx_whisper_module)
+    warmup_backend(PROCESS_WINDOW_S)
 else:
     switch_to_whisperx()
 
