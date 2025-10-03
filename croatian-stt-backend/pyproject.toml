@@ -1,0 +1,24 @@
+[project]
+name = "croatian-stt-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.118.0",
+    "hunspell>=0.5.5",
+    "pyjwt>=2.10.1",
+    "python-multipart>=0.0.20",
+    "mlx>=0.15.0",
+    "mlx-whisper>=0.4.0",
+    "openai-whisper>=20231117",
+    "torch>=2.8.0",
+    "torchaudio>=2.8.0",
+    "torchvision>=0.23.0",
+    "websockets>=12.0",
+    "uvicorn>=0.37.0",
+    "whisperx",
+]
+
+[tool.uv.sources]
+whisperx = { git = "https://github.com/m-bain/whisperx.git" }

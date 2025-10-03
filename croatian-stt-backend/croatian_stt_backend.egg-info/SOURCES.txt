@@ -1,0 +1,8 @@
+README.md
+main.py
+pyproject.toml
+croatian_stt_backend.egg-info/PKG-INFO
+croatian_stt_backend.egg-info/SOURCES.txt
+croatian_stt_backend.egg-info/dependency_links.txt
+croatian_stt_backend.egg-info/requires.txt
+croatian_stt_backend.egg-info/top_level.txt
