@@ -1,13 +1,16 @@
 import argparse
+import asyncio
 import datetime
 import importlib
 import inspect
 import json
 import os
+import platform
 import re
 import textwrap
-import platform
 import threading
+from dataclasses import dataclass
+from queue import Queue
 from pathlib import Path
 from typing import Any, Callable
 
@@ -130,10 +133,15 @@ class OpenAIWhisperWrapper:
     def __init__(self, model: Any, language: str) -> None:
         self._model = model
         self._language = language
+        self._transcribe_params = inspect.signature(model.transcribe).parameters
 
     def transcribe(self, audio: Any, **kwargs: Any) -> dict:
         kwargs.pop("batch_size", None)  # not supported by openai/whisper
         kwargs.setdefault("language", self._language)
+        if "task" in self._transcribe_params:
+            kwargs.setdefault("task", "transcribe")
+        if "translate" in self._transcribe_params:
+            kwargs.setdefault("translate", False)
         return self._model.transcribe(audio, **kwargs)
 
 
@@ -146,6 +154,64 @@ mlx_whisper_module: Any | None = None
 
 BackendEntry = tuple[Callable[[np.ndarray], list[dict[str, Any]]], Callable[[], None], str]
 backend_cache: dict[tuple[str, ...], BackendEntry] = {}
+
+
+@dataclass
+class TranscriptionJob:
+    audio: np.ndarray
+    chunk_offset: float
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future
+
+
+@dataclass
+class TranscriptionResult:
+    chunk_offset: float
+    segments: list[dict[str, Any]]
+
+
+job_queue: Queue[TranscriptionJob] = Queue()
+_worker_started = threading.Event()
+
+
+def _resolve_future(
+    future: asyncio.Future,
+    result: TranscriptionResult | None = None,
+    exc: Exception | None = None,
+) -> None:
+    if future.cancelled():
+        return
+    try:
+        if exc is not None:
+            future.set_exception(exc)
+        else:
+            future.set_result(result)
+    except asyncio.InvalidStateError:
+        pass
+
+
+def _worker_loop() -> None:
+    while True:
+        job = job_queue.get()
+        try:
+            if job.future.cancelled():
+                continue
+            segments = transcribe_window(job.audio)
+            backend_sync()
+            result = TranscriptionResult(job.chunk_offset, segments)
+            job.loop.call_soon_threadsafe(_resolve_future, job.future, result)
+        except Exception as err:  # pragma: no cover - runtime safeguard
+            job.loop.call_soon_threadsafe(_resolve_future, job.future, None, err)
+        finally:
+            job_queue.task_done()
+
+
+def ensure_worker_started() -> None:
+    if _worker_started.is_set():
+        return
+    worker = threading.Thread(target=_worker_loop, name="asr-worker", daemon=True)
+    worker.start()
+    _worker_started.set()
 
 
 _warmup_lock = threading.Lock()
@@ -177,6 +243,12 @@ def build_transcribe_kwargs(transcribe_model: Any) -> dict[str, object]:
     if "fp16" in params:
         # Disable fp16 to avoid issues on MPS/CPU; CUDA precision is managed internally.
         kwargs["fp16"] = False
+    if "language" in params:
+        kwargs["language"] = ASR_LANGUAGE
+    if "task" in params:
+        kwargs["task"] = "transcribe"
+    if "translate" in params:
+        kwargs["translate"] = False
     return kwargs
 
 
@@ -307,14 +379,30 @@ def configure_mlx(mlx_module: Any) -> BackendEntry:
 
     print(f"Loading MLX Whisper model: {MLX_WHISPER_MODEL}")
 
+    mlx_params = inspect.signature(mlx_module.transcribe).parameters
+
+    def build_mlx_kwargs() -> dict[str, object]:
+        kwargs: dict[str, object] = {
+            "path_or_hf_repo": MLX_WHISPER_MODEL,
+            "word_timestamps": True,
+        }
+        if "fp16" in mlx_params:
+            kwargs["fp16"] = MLX_WHISPER_FP16
+        if "language" in mlx_params:
+            kwargs["language"] = ASR_LANGUAGE
+        if "task" in mlx_params:
+            kwargs["task"] = "transcribe"
+        if "translate" in mlx_params:
+            kwargs["translate"] = False
+        return kwargs
+
+    mlx_transcribe_kwargs = build_mlx_kwargs()
+
     def mlx_transcribe(audio: np.ndarray) -> list[dict[str, Any]]:
         try:
             result = mlx_module.transcribe(
                 audio,
-                path_or_hf_repo=MLX_WHISPER_MODEL,
-                word_timestamps=True,
-                language=ASR_LANGUAGE,
-                fp16=MLX_WHISPER_FP16,
+                **mlx_transcribe_kwargs,
             )
         except Exception as err:  # pragma: no cover - runtime safeguard
             if ASR_BACKEND == "auto":
@@ -410,6 +498,89 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 srt_index = 1
+srt_lock = threading.Lock()
+
+
+async def _send_ws_error(ws: WebSocket, detail: str) -> None:
+    payload = {"type": "error", "detail": detail}
+    try:
+        await ws.send_text(json.dumps(payload))
+    except Exception:
+        return
+
+
+async def _stream_transcription(job: TranscriptionJob, ws: WebSocket) -> None:
+    try:
+        result = await job.future
+    except asyncio.CancelledError:  # propagate cancellation while notifying worker
+        job.future.cancel()
+        raise
+    except Exception as err:
+        await _send_ws_error(ws, f"Transcription failed: {err}")
+        return
+
+    segments = result.segments
+    if not segments:
+        return
+
+    messages: list[dict[str, Any]] = []
+    global srt_index
+    with srt_lock:
+        chunk_offset = result.chunk_offset
+        for seg in segments:
+            start = chunk_offset + float(seg.get("start", 0.0))
+            end = chunk_offset + float(seg.get("end", 0.0))
+
+            words_info = seg.get("words") or []
+            if not words_info:
+                continue
+
+            words = []
+            for w in words_info:
+                word = w.get("word")
+                if not word:
+                    continue
+                conf = float(w.get("probability", 1.0))
+                words.append(f"[?{word}?]" if conf < LOW_CONF_THRESH else word)
+
+            raw_text = " ".join(words).strip()
+            if not raw_text:
+                continue
+
+            corrected = hunspell_correct(raw_text)
+            corrected_wrapped = wrap_subtitle(
+                corrected,
+                width=SUB_WRAP_WIDTH,
+                max_lines=SUB_WRAP_LINES,
+            )
+
+            plain_ts = str(datetime.timedelta(seconds=int(start)))
+            with RAW_PATH.open("a", encoding="utf-8") as f:
+                f.write(f"[{plain_ts}] {raw_text}\n")
+            with TXT_PATH.open("a", encoding="utf-8") as f:
+                f.write(f"[{plain_ts}] {corrected}\n")
+            with SRT_PATH.open("a", encoding="utf-8") as f:
+                f.write(f"{srt_index}\n{srt_ts(start)} --> {srt_ts(end)}\n{corrected_wrapped}\n\n")
+            with VTT_PATH.open("a", encoding="utf-8") as f:
+                f.write(f"{vtt_ts(start)} --> {vtt_ts(end)}\n{corrected_wrapped}\n\n")
+
+            messages.append({
+                "type": "segment",
+                "srtIndex": srt_index,
+                "start": start,
+                "end": end,
+                "raw": raw_text,
+                "corrected": corrected,
+                "correctedWrapped": corrected_wrapped,
+            })
+            srt_index += 1
+
+    for message in messages:
+        try:
+            await ws.send_text(json.dumps(message))
+        except Exception:
+            break
+
 
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
@@ -425,10 +596,12 @@ async def ws_handler(ws: WebSocket):
         return
 
     await ws.accept()
+    ensure_worker_started()
 
-    global srt_index
+    loop = asyncio.get_running_loop()
     pcm_buffer = np.zeros(0, dtype=np.int16)
     processed_samples = 0
+    pending_tasks: set[asyncio.Task[Any]] = set()
 
     try:
         while True:
@@ -438,67 +611,34 @@ async def ws_handler(ws: WebSocket):
             pcm_buffer = np.concatenate([pcm_buffer, chunk])
 
             need = SAMPLE_RATE * PROCESS_WINDOW_S
-            if len(pcm_buffer) >= need:
+            while len(pcm_buffer) >= need:
                 # Take first window, keep remainder
                 window = pcm_buffer[:need].astype(np.float32) / 32768.0
                 pcm_buffer = pcm_buffer[need:]
                 chunk_offset = processed_samples / SAMPLE_RATE
                 processed_samples += need
 
-                # Run backend transcription for this window
-                segments = transcribe_window(window)
-                backend_sync()
-                if not segments:
-                    continue
+                future = loop.create_future()
+                job = TranscriptionJob(
+                    audio=window,
+                    chunk_offset=chunk_offset,
+                    loop=loop,
+                    future=future,
+                )
+                job_queue.put(job)
 
-                # Build + correct each segment
-                for seg in segments:
-                    start = chunk_offset + float(seg["start"])
-                    end = chunk_offset + float(seg["end"])
-
-                    # raw with low-confidence highlighting
-                    words_info = seg.get("words") or []
-                    if not words_info:
-                        continue
-
-                    words = []
-                    for w in words_info:
-                        word = w["word"]
-                        conf = float(w.get("probability", 1.0))
-                        words.append(f"[?{word}?]" if conf < LOW_CONF_THRESH else word)
-                    raw_text = " ".join(words).strip()
-                    if not raw_text:
-                        continue
-
-                    # correct (Croatian)
-                    corrected = hunspell_correct(raw_text)
-                    corrected_wrapped = wrap_subtitle(corrected, width=SUB_WRAP_WIDTH, max_lines=SUB_WRAP_LINES)
-
-                    # Append to files
-                    plain_ts = str(datetime.timedelta(seconds=int(start)))
-                    with RAW_PATH.open("a", encoding="utf-8") as f:
-                        f.write(f"[{plain_ts}] {raw_text}\n")
-                    with TXT_PATH.open("a", encoding="utf-8") as f:
-                        f.write(f"[{plain_ts}] {corrected}\n")
-                    with SRT_PATH.open("a", encoding="utf-8") as f:
-                        f.write(f"{srt_index}\n{srt_ts(start)} --> {srt_ts(end)}\n{corrected_wrapped}\n\n")
-                    with VTT_PATH.open("a", encoding="utf-8") as f:
-                        f.write(f"{vtt_ts(start)} --> {vtt_ts(end)}\n{corrected_wrapped}\n\n")
-
-                    # stream JSON back
-                    await ws.send_text(json.dumps({
-                        "type": "segment",
-                        "srtIndex": srt_index,
-                        "start": start,
-                        "end": end,
-                        "raw": raw_text,
-                        "corrected": corrected,
-                        "correctedWrapped": corrected_wrapped,
-                    }))
-                    srt_index += 1
+                task = asyncio.create_task(_stream_transcription(job, ws))
+                pending_tasks.add(task)
+                task.add_done_callback(pending_tasks.discard)
 
     except WebSocketDisconnect:
         pass
+    finally:
+        if pending_tasks:
+            for task in list(pending_tasks):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
 # downloads
 @app.get("/download/raw")
