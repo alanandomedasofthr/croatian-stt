@@ -1,0 +1,18 @@
+# General OS files
+.DS_Store
+
+# Package managers
+pnpm-debug.log*
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Backend runtime outputs
+croatian-stt-backend/out/
+
+# IDE settings
+.vscode/
+.idea/
